@@ -47,7 +47,7 @@ MouseCursor buildCursorOfCache(
             ..height = height
             ..hotX = cache.hotx
             ..hotY = cache.hoty);
-      cursor.addKey(key);
+      cursor.addKey(key, cache.id);
     }
     return FlutterCustomMemoryImageCursor(key: key);
   }

@@ -19,6 +19,7 @@ use scrap::wayland::pipewire::RDP_SESSION_INFO;
 #[cfg(target_os = "linux")]
 use std::sync::mpsc;
 use std::{
+    collections::VecDeque,
     convert::TryFrom,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
@@ -114,10 +115,13 @@ const KEY_CHAR_START: u64 = 9999;
 #[cfg(target_os = "linux")]
 const XKB_KEY_INSERT: u16 = evdev::Key::KEY_INSERT.code() + 8;
 
+const CURSOR_CACHE_MAX: usize = 64;
+
 #[derive(Clone, Default)]
 pub struct MouseCursorSub {
     inner: ConnInner,
     cached: HashMap<u64, Arc<Message>>,
+    order: VecDeque<u64>,
 }
 
 impl From<ConnInner> for MouseCursorSub {
@@ -125,6 +129,7 @@ impl From<ConnInner> for MouseCursorSub {
         Self {
             inner,
             cached: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 }
@@ -138,13 +143,23 @@ impl Subscriber for MouseCursorSub {
     #[inline]
     fn send(&mut self, msg: Arc<Message>) {
         if let Some(message::Union::CursorData(cd)) = &msg.union {
-            if let Some(msg) = self.cached.get(&cd.id) {
-                self.inner.send(msg.clone());
+            if let Some(cached_msg) = self.cached.get(&cd.id) {
+                if let Some(idx) = self.order.iter().position(|&id| id == cd.id) {
+                    self.order.remove(idx);
+                }
+                self.order.push_back(cd.id);
+                self.inner.send(cached_msg.clone());
             } else {
                 self.inner.send(msg.clone());
                 let mut tmp = Message::new();
                 // only send id out, require client side cache also
                 tmp.set_cursor_id(cd.id);
+                if self.cached.len() >= CURSOR_CACHE_MAX {
+                    if let Some(oldest_id) = self.order.pop_front() {
+                        self.cached.remove(&oldest_id);
+                    }
+                }
+                self.order.push_back(cd.id);
                 self.cached.insert(cd.id, Arc::new(tmp));
             }
         } else {
@@ -433,7 +448,6 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
                 // Past the ceiling, drop the map and start over: the next request for any evicted
                 // shape just recompresses it, and the ceiling comfortably covers every static shape
                 // plus a generous animation window.
-                const CURSOR_CACHE_MAX: usize = 64;
                 if state.cached_cursor_data.len() >= CURSOR_CACHE_MAX {
                     state.cached_cursor_data.clear();
                 }
@@ -2530,3 +2544,54 @@ lazy_static::lazy_static! {
         (ControlKey::Delete, true),
     ].iter().map(|(a, b)| (a.value(), b.clone())).collect();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mouse_cursor_sub_lru_eviction() {
+        let mut sub = MouseCursorSub::default();
+
+        // Send 64 distinct cursors (1..=64)
+        for id in 1..=CURSOR_CACHE_MAX as u64 {
+            let mut cd = base::message_proto::CursorData::new();
+            cd.id = id;
+            let mut msg = Message::new();
+            msg.set_cursor_data(cd);
+            sub.send(Arc::new(msg));
+        }
+        assert_eq!(sub.cached.len(), CURSOR_CACHE_MAX);
+        assert_eq!(sub.order.len(), CURSOR_CACHE_MAX);
+        assert_eq!(sub.order.front(), Some(&1));
+        assert_eq!(sub.order.back(), Some(&(CURSOR_CACHE_MAX as u64)));
+
+        // Send cursor 1 again: it should move to the back of order (MRU)
+        {
+            let mut cd = base::message_proto::CursorData::new();
+            cd.id = 1;
+            let mut msg = Message::new();
+            msg.set_cursor_data(cd);
+            sub.send(Arc::new(msg));
+        }
+        assert_eq!(sub.cached.len(), CURSOR_CACHE_MAX);
+        assert_eq!(sub.order.front(), Some(&2));
+        assert_eq!(sub.order.back(), Some(&1));
+
+        // Send cursor 65: cursor 2 should be evicted (LRU)
+        {
+            let mut cd = base::message_proto::CursorData::new();
+            cd.id = 65;
+            let mut msg = Message::new();
+            msg.set_cursor_data(cd);
+            sub.send(Arc::new(msg));
+        }
+        assert_eq!(sub.cached.len(), CURSOR_CACHE_MAX);
+        assert!(!sub.cached.contains_key(&2));
+        assert!(sub.cached.contains_key(&1));
+        assert!(sub.cached.contains_key(&65));
+        assert_eq!(sub.order.front(), Some(&3));
+        assert_eq!(sub.order.back(), Some(&65));
+    }
+}
+

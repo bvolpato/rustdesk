@@ -56,7 +56,7 @@ final _constSessionId = Uuid().v4obj();
 const _restartReconnectSilentDelaySecs = 5;
 
 class CachedPeerData {
-  static const int kMaxCursorDataCount = 50;
+  static const int kMaxCursorDataCount = 64;
 
   Map<String, dynamic> updatePrivacyMode = {};
   Map<String, dynamic> peerInfo = {};
@@ -1661,6 +1661,15 @@ class FfiModel with ChangeNotifier {
 
   handleCursorId(Map<String, dynamic> evt) {
     cachedPeerData.lastCursorId = evt;
+    final id = evt['id'];
+    if (id != null) {
+      final index =
+          cachedPeerData.cursorDataList.indexWhere((item) => item['id'] == id);
+      if (index != -1) {
+        final item = cachedPeerData.cursorDataList.removeAt(index);
+        cachedPeerData.cursorDataList.add(item);
+      }
+    }
     parent.target?.cursorModel.updateCursorId(evt);
   }
 
@@ -3084,12 +3093,13 @@ class PredefinedCursor {
 }
 
 class CursorModel with ChangeNotifier {
-  static const int kMaxCachedCursors = 50;
+  static const int kMaxCachedCursors = 64;
   ui.Image? _image;
   final _images = <String, Tuple3<ui.Image, double, double>>{};
   CursorData? _cache;
   final _cacheMap = <String, CursorData>{};
   final _cacheKeys = <String>{};
+  final _idToCacheKeys = <String, Set<String>>{};
   double _x = -10000;
   double _y = -10000;
   // int.parse(evt['id']) may cause FormatException
@@ -3203,7 +3213,20 @@ class CursorModel with ChangeNotifier {
   CursorModel(this.parent);
 
   Set<String> get cachedKeys => _cacheKeys;
-  addKey(String key) => _cacheKeys.add(key);
+  addKey(String key, [String? id]) {
+    _cacheKeys.add(key);
+    if (id == null) {
+      for (final c in _cacheMap.values) {
+        if (key.startsWith('${c.peerId}_${c.id}_')) {
+          id = c.id;
+          break;
+        }
+      }
+    }
+    if (id != null) {
+      (_idToCacheKeys[id] ??= {}).add(key);
+    }
+  }
 
   // remote physical display coordinate
   // For update pan (mobile), onOneFingerPanStart, onOneFingerPanUpdate, onHoldDragUpdate
@@ -3514,13 +3537,12 @@ class CursorModel with ChangeNotifier {
     }
     if (await _updateCache(rgba, image, id, hotx, hoty, width, height)) {
       _images[id]?.item1.dispose();
+      _images.remove(id);
       _images[id] = Tuple3(image, hotx, hoty);
       if (_images.length > kMaxCachedCursors) {
         final oldestId = _images.keys.firstWhere((k) => k != id && k != _id, orElse: () => '');
         if (oldestId.isNotEmpty) {
-          _images.remove(oldestId)?.item1.dispose();
-          _cacheMap.remove(oldestId);
-          _cacheKeys.remove(oldestId);
+          _evictCursor(oldestId);
         }
       }
     }
@@ -3598,7 +3620,35 @@ class CursorModel with ChangeNotifier {
     }
   }
 
+  void _evictCursor(String id) {
+    _images.remove(id)?.item1.dispose();
+    _cacheMap.remove(id);
+    final keys = _idToCacheKeys.remove(id);
+    if (keys != null) {
+      for (final key in keys) {
+        _cacheKeys.remove(key);
+        try {
+          deleteCustomCursor(key);
+        } catch (e) {
+          debugPrint('Failed to delete custom cursor $key: $e');
+        }
+      }
+    }
+  }
+
+  void _touch(String id) {
+    final img = _images.remove(id);
+    if (img != null) {
+      _images[id] = img;
+    }
+    final cache = _cacheMap.remove(id);
+    if (cache != null) {
+      _cacheMap[id] = cache;
+    }
+  }
+
   updateCursorId(Map<String, dynamic> evt) {
+    _touch(_id);
     if (!_updateCurData()) {
       debugPrint(
           'WARNING: updateCursorId $_id, cache is ${_cache == null ? "null" : "not null"}. without notifyListeners()');
@@ -3645,7 +3695,7 @@ class CursorModel with ChangeNotifier {
 
   clear() {
     _x = -10000;
-    _x = -10000;
+    _y = -10000;
     _image = null;
     _firstUpdateMouseTime = null;
     gotMouseControl = true;
@@ -3654,6 +3704,7 @@ class CursorModel with ChangeNotifier {
     _clearCache();
     _cache = null;
     _cacheMap.clear();
+    _idToCacheKeys.clear();
   }
 
   _clearCache() {
@@ -3662,6 +3713,8 @@ class CursorModel with ChangeNotifier {
       debugPrint("deleting cursor with key $k");
       deleteCustomCursor(k);
     }
+    _cacheKeys.clear();
+    _idToCacheKeys.clear();
     resetSystemCursor();
   }
 
