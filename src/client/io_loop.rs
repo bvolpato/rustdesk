@@ -1507,6 +1507,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         }
 
                         self.is_connected = true;
+                        self.handler.logged_in.store(true, Ordering::SeqCst);
                     }
                     _ => {}
                 },

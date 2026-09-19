@@ -33,7 +33,7 @@ use std::{
     ops::{Deref, DerefMut},
     str::FromStr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
     time::SystemTime,
@@ -66,6 +66,9 @@ pub struct Session<T: InvokeUiSession> {
     pub server_clipboard_enabled: Arc<RwLock<bool>>,
     pub last_change_display: Arc<Mutex<ChangeDisplayRecord>>,
     pub connection_round_state: Arc<Mutex<ConnectionRoundState>>,
+    // The peer's PeerInfo is in. `connection_round_state` is Connected once the transport is,
+    // while the login it carries may still be waiting on a password or the peer's consent.
+    pub logged_in: Arc<AtomicBool>,
     pub printer_names: Arc<RwLock<HashMap<i32, String>>>,
     // Indicate whether the session is reconnected.
     // Used to auto start file transfer after reconnection.
@@ -1289,6 +1292,7 @@ impl<T: InvokeUiSession> Session<T> {
         }
         let round = connection_round_state_lock.new_round();
         drop(connection_round_state_lock);
+        self.logged_in.store(false, Ordering::SeqCst);
 
         let cloned = self.clone();
 
